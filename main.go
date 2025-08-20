@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	mathrand "math/rand"
 	"os"
 	"sort"
@@ -108,10 +109,13 @@ func initSchema(ctx context.Context, db *pgxpool.Pool) error {
 			input JSONB NOT NULL,
 			status TEXT NOT NULL DEFAULT 'pending', -- pending|running|completed|failed
 			result JSONB,
+			current_step JSONB,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 			finished_at TIMESTAMPTZ
 		);`,
+		// Backfill-safe add for existing DBs
+		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_step JSONB;`,
 		// jobs table (general queue)
 		`CREATE TABLE IF NOT EXISTS jobs (
 			id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -163,6 +167,13 @@ func createTaskWithJobs(ctx context.Context, db *pgxpool.Pool, orgID, provider s
 		return "", err
 	}
 
+	// Step 1: enqueueing jobs (5%)
+	_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
+		Name:        "enqueue_jobs",
+		Description: fmt.Sprintf("Enqueuing %d jobs", count),
+		Percentage:  5,
+	})
+
 	// Create jobs
 	now := time.Now()
 	batch := db.Config().ConnConfig.RuntimeParams
@@ -194,6 +205,13 @@ func createTaskWithJobs(ctx context.Context, db *pgxpool.Pool, orgID, provider s
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
+
+	// Step 2: processing (10% to 99% handled by monitor)
+	_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
+		Name:        "process_jobs",
+		Description: "Processing enqueued jobs",
+		Percentage:  10,
+	})
 	return taskID, nil
 }
 
@@ -201,6 +219,7 @@ func monitorTask(ctx context.Context, db *pgxpool.Pool, taskID string) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	start := time.Now()
+	lastReported := -1
 	for {
 		<-ticker.C
 		var total, done, failed, processing int
@@ -219,6 +238,21 @@ func monitorTask(ctx context.Context, db *pgxpool.Pool, taskID string) {
 		fmt.Printf("[monitor] elapsed=%s total=%d done=%d failed=%d processing=%d pending=%d\n",
 			time.Since(start).Truncate(time.Second), total, done, failed, processing, total-done-failed-processing)
 
+		// Live progress → 10..99% based on completed fraction
+		if total > 0 && done+failed < total {
+			frac := float64(done+failed) / float64(total)
+			pct := int(math.Max(10, math.Min(99, math.Round(10.0+frac*90.0))))
+			if pct != lastReported {
+				_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
+					Name:        "process_jobs",
+					Description: "Processing enqueued jobs",
+					Percentage:  pct,
+				})
+				fmt.Printf("[step] %d%% - process_jobs\n", pct)
+				lastReported = pct
+			}
+		}
+
 		if total > 0 && done+failed == total {
 			// mark task completed/failed
 			status := "completed"
@@ -230,6 +264,14 @@ func monitorTask(ctx context.Context, db *pgxpool.Pool, taskID string) {
 				SET status=$2, finished_at=now(), updated_at=now(), result=$3::jsonb
 				WHERE id=$1
 			`, taskID, status, fmt.Sprintf(`{"done":%d,"failed":%d}`, done, failed))
+
+			// Finalize step (100%)
+			_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
+				Name:        "finalize",
+				Description: "Task finalized",
+				Percentage:  100,
+			})
+			fmt.Println("[step] 100% - finalize")
 			fmt.Println("Task finished with status:", status)
 			return
 		}
@@ -485,6 +527,24 @@ func markSucceeded(ctx context.Context, db *pgxpool.Pool, id string, resultJSON 
 		SET status='succeeded', result=$2::jsonb, updated_at=now()
 		WHERE id=$1
 	`, id, resultJSON)
+	return err
+}
+
+// -------------- Task step persistence --------------
+
+type TaskStep struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Percentage  int    `json:"percentage"`
+}
+
+func setTaskCurrentStep(ctx context.Context, db *pgxpool.Pool, taskID string, step TaskStep) error {
+	b, _ := json.Marshal(step)
+	_, err := db.Exec(ctx, `
+		UPDATE tasks
+		SET current_step = $2::jsonb, updated_at = now()
+		WHERE id = $1
+	`, taskID, string(b))
 	return err
 }
 
