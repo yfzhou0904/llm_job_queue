@@ -31,7 +31,7 @@ func initSchema(ctx context.Context, db *pgxpool.Pool) error {
 			org_id TEXT NOT NULL,
 			task_id uuid REFERENCES tasks(id),
 			type TEXT NOT NULL,
-			input JSONB NOT NULL, -- includes {"provider": "openai" | "anthropic" | ...}
+			input JSONB NOT NULL,
 			status TEXT NOT NULL DEFAULT 'pending',  -- pending|processing|succeeded|failed
 			result JSONB,
 			errors TEXT[] NOT NULL DEFAULT '{}'::TEXT[],

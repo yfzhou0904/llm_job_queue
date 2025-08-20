@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/time/rate"
 )
 
 // Constants for worker operations
@@ -21,8 +20,7 @@ const (
 	JobProcessingTimeout  = 3 * time.Minute         // Timeout for job processing
 
 	// Worker thresholds
-	MinRefillAmount     = 100 // Minimum jobs to fetch on refill
-	DefaultRateLimitRPS = 1   // Default RPS when provider not configured
+	MinRefillAmount = 100 // Minimum jobs to fetch on refill
 )
 
 type WorkerConfig struct {
@@ -30,14 +28,12 @@ type WorkerConfig struct {
 	RefillTrig    int
 	Inflight      int
 	StatsInterval time.Duration
-	ProviderRPS   map[string]int
 }
 
 type Worker struct {
 	db     *pgxpool.Pool
 	config WorkerConfig
 
-	providerLimiter   map[string]*rate.Limiter
 	inflightCh        chan struct{}
 	queues            map[string][]JobMeta
 	queuesMutex       sync.Mutex
@@ -59,21 +55,11 @@ func NewWorker(db *pgxpool.Pool, config WorkerConfig) *Worker {
 		statsFormatter:    NewStatsFormatter(),
 	}
 
-	w.setupProviderLimiters()
 	w.setupInflightLimiter()
 
 	return w
 }
 
-func (w *Worker) setupProviderLimiters() {
-	w.providerLimiter = make(map[string]*rate.Limiter)
-	for provider, rps := range w.config.ProviderRPS {
-		if rps < 1 {
-			rps = 1
-		}
-		w.providerLimiter[provider] = rate.NewLimiter(rate.Limit(rps), rps)
-	}
-}
 
 func (w *Worker) setupInflightLimiter() {
 	w.inflightCh = make(chan struct{}, w.config.Inflight)
@@ -195,9 +181,8 @@ type InflightStats struct {
 }
 
 type ProcessingStats struct {
-	Total      int
-	ByProvider map[string]int
-	ByOrg      map[string]int
+	Total int
+	ByOrg map[string]int
 }
 
 type QueueStats struct {
@@ -217,20 +202,14 @@ func (w *Worker) getProcessingStats() ProcessingStats {
 	w.processingTracker.mu.Lock()
 	defer w.processingTracker.mu.Unlock()
 
-	byProvider := make(map[string]int, len(w.processingTracker.byProvider))
-	for k, v := range w.processingTracker.byProvider {
-		byProvider[k] = v
-	}
-
 	byOrg := make(map[string]int, len(w.processingTracker.byOrg))
 	for k, v := range w.processingTracker.byOrg {
 		byOrg[k] = v
 	}
 
 	return ProcessingStats{
-		Total:      w.processingTracker.total,
-		ByProvider: byProvider,
-		ByOrg:      byOrg,
+		Total: w.processingTracker.total,
+		ByOrg: byOrg,
 	}
 }
 
@@ -290,7 +269,6 @@ func (sf *StatsFormatter) formatKeyValueMap(b *strings.Builder, m map[string]int
 
 func (sf *StatsFormatter) FormatProcessingStats(b *strings.Builder, stats ProcessingStats) {
 	fmt.Fprintf(b, "  processing: total=%d", stats.Total)
-	sf.formatKeyValueMap(b, stats.ByProvider, "by_provider")
 	sf.formatKeyValueMap(b, stats.ByOrg, "by_org")
 	b.WriteByte('\n')
 }
@@ -408,38 +386,22 @@ func (w *Worker) popCandidateFromOrg(org string) (JobMeta, bool) {
 }
 
 func (w *Worker) processJobAsync(ctx context.Context, claimed ClaimedJob) {
-	provider := providerFromInput(claimed.Input)
-	lim := w.getProviderLimiter(provider)
-
 	<-w.inflightCh
-	go w.processJob(ctx, claimed, provider, lim)
+	go w.processJob(ctx, claimed)
 }
 
-func (w *Worker) getProviderLimiter(provider string) *rate.Limiter {
-	lim := w.providerLimiter[provider]
-	if lim == nil {
-		lim = rate.NewLimiter(DefaultRateLimitRPS, DefaultRateLimitRPS)
-		w.providerLimiter[provider] = lim
-	}
-	return lim
-}
 
-func (w *Worker) processJob(ctx context.Context, job ClaimedJob, provider string, lim *rate.Limiter) {
+func (w *Worker) processJob(ctx context.Context, job ClaimedJob) {
 	defer func() {
 		w.inflightCh <- struct{}{}
 		w.seen.Delete(job.ID)
-		w.processingTracker.done(provider, job.Org)
+		w.processingTracker.done(job.Org)
 	}()
 
 	ctx2, cancel := context.WithTimeout(ctx, JobProcessingTimeout)
 	defer cancel()
 
-	if err := lim.Wait(ctx2); err != nil {
-		_ = appendErrorOrRetry(ctx, w.db, job.ID, "provider limiter wait canceled")
-		return
-	}
-
-	w.processingTracker.add(provider, job.Org)
+	w.processingTracker.add(job.Org)
 
 	start := time.Now()
 	sleepDur, fail := simulateRun()
@@ -457,7 +419,7 @@ func (w *Worker) processJob(ctx context.Context, job ClaimedJob, provider string
 
 	result := map[string]any{
 		"ok":        true,
-		"provider":  provider,
+		"type":      job.Type,
 		"elapsedMs": time.Since(start).Milliseconds(),
 	}
 	resJSON, _ := json.Marshal(result)
@@ -473,11 +435,6 @@ func runWorker(ctx context.Context, db *pgxpool.Pool) error {
 		RefillTrig:    *refillTrig,
 		Inflight:      *inflight,
 		StatsInterval: *statsInterval,
-		ProviderRPS: map[string]int{
-			"openai":    *rpsOpenAI,
-			"anthropic": *rpsAnthropic,
-			"gemini":    *rpsGemini,
-		},
 	}
 
 	worker := NewWorker(db, config)

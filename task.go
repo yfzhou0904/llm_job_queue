@@ -13,17 +13,17 @@ import (
 // Constants for task management
 const (
 	// Progress percentages
-	ProgressEnqueueJobs    = 5   // Initial job enqueue step
-	ProgressProcessStart   = 10  // Start of job processing
-	ProgressProcessMax     = 99  // Maximum progress during processing
-	ProgressComplete       = 100 // Task completion
-	
+	ProgressEnqueueJobs  = 5   // Initial job enqueue step
+	ProgressProcessStart = 10  // Start of job processing
+	ProgressProcessMax   = 99  // Maximum progress during processing
+	ProgressComplete     = 100 // Task completion
+
 	// Job configuration
-	DefaultMaxAttempts     = 3 // Default retry limit for jobs
-	DefaultHexSeedLength   = 8 // Length of random hex seed
-	
+	DefaultMaxAttempts   = 3 // Default retry limit for jobs
+	DefaultHexSeedLength = 8 // Length of random hex seed
+
 	// Monitoring
-	TaskMonitorInterval    = 2 * time.Second // How often to check task progress
+	TaskMonitorInterval = 2 * time.Second // How often to check task progress
 )
 
 type TaskStep struct {
@@ -40,11 +40,10 @@ type JobCounts struct {
 	Pending    int
 }
 
-func createTaskWithJobs(ctx context.Context, db *pgxpool.Pool, orgID, provider string, count int) (string, error) {
+func createTaskWithJobs(ctx context.Context, db *pgxpool.Pool, orgID string, count int) (string, error) {
 	// Create task
 	taskInput := map[string]any{
-		"reason":   "demo load",
-		"provider": provider,
+		"reason": "demo load",
 	}
 	taskInputJSON, _ := json.Marshal(taskInput)
 
@@ -78,7 +77,6 @@ func createTaskWithJobs(ctx context.Context, db *pgxpool.Pool, orgID, provider s
 
 	for i := 0; i < count; i++ {
 		jobInput := map[string]any{
-			"provider": provider,
 			"payload": map[string]any{
 				"row_index": i,
 				"seed":      randHex(DefaultHexSeedLength),
@@ -149,7 +147,7 @@ func finalizeTask(ctx context.Context, db *pgxpool.Pool, taskID string, counts J
 	if counts.Done == 0 {
 		status = "failed"
 	}
-	
+
 	_, err := db.Exec(ctx, `
 		UPDATE tasks
 		SET status=$2, finished_at=now(), updated_at=now(), result=$3::jsonb
@@ -174,18 +172,18 @@ func monitorTask(ctx context.Context, db *pgxpool.Pool, taskID string) {
 	defer ticker.Stop()
 	start := time.Now()
 	lastReported := -1
-	
+
 	for {
 		<-ticker.C
-		
+
 		counts, err := getJobCounts(ctx, db, taskID)
 		if err != nil {
 			fmt.Println("monitor error:", err)
 			continue
 		}
-		
+
 		fmt.Printf("[monitor] elapsed=%s total=%d done=%d failed=%d processing=%d pending=%d\n",
-			time.Since(start).Truncate(time.Second), counts.Total, counts.Done, 
+			time.Since(start).Truncate(time.Second), counts.Total, counts.Done,
 			counts.Failed, counts.Processing, counts.Pending)
 
 		pct := calculateProgress(counts)
