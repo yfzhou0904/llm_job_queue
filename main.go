@@ -29,24 +29,32 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"math"
 	mathrand "math/rand"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/time/rate"
+)
+
+// Constants for magic numbers
+const (
+	// Simulation parameters
+	SimulationMeanDuration  = 30.0  // seconds
+	SimulationStdDev        = 6.0   // seconds
+	SimulationMinDuration   = 1.0   // seconds
+	SimulationMaxDuration   = 120.0 // seconds
+	SimulationFailureRate   = 1     // 1% failure rate
+	SimulationFailureChance = 100
 )
 
 var (
-	mode      = flag.String("mode", "init", "init | worker | create-task")
-	dsn       = flag.String("dsn", "", "Postgres DSN")
-	orgFlag   = flag.String("org", "orgA", "Org ID (for create-task)")
-	providerF = flag.String("provider", "openai", "Provider name for jobs (for create-task)")
-	nJobs     = flag.Int("jobs", 50, "Number of jobs to create (for create-task)")
+	mode         = flag.String("mode", "init", "init | worker | create-task")
+	dsn          = flag.String("dsn", "", "Postgres DSN")
+	orgFlag      = flag.String("org", "orgA", "Org ID (for create-task)")
+	providerFlag = flag.String("provider", "openai", "Provider name for jobs (for create-task)")
+	nJobs        = flag.Int("jobs", 50, "Number of jobs to create (for create-task)")
 
 	// Worker tuning
 	prefetchN  = flag.Int("prefetch", 1000, "Target number of prefetched candidate jobs")
@@ -57,6 +65,9 @@ var (
 	rpsOpenAI    = flag.Int("rps.openai", 120, "OpenAI RPS cap")
 	rpsAnthropic = flag.Int("rps.anthropic", 80, "Anthropic RPS cap")
 	rpsGemini    = flag.Int("rps.gemini", 60, "Gemini RPS cap")
+
+	// Introspection / metrics (in-memory only)
+	statsInterval = flag.Duration("stats_interval", 0, "Interval for worker stats logging (e.g. 5s, 1m); 0 to disable")
 )
 
 func main() {
@@ -75,494 +86,92 @@ func main() {
 
 	switch *mode {
 	case "init":
-		if err := initSchema(ctx, pool); err != nil {
-			panic(err)
-		}
-		fmt.Println("Schema initialized.")
+		handleInitMode(ctx, pool)
 	case "create-task":
-		taskID, err := createTaskWithJobs(ctx, pool, *orgFlag, *providerF, *nJobs)
-		if err != nil {
-			panic(err)
-		}
-		fmt.Printf("Created task %s with %d jobs for org=%s provider=%s\n", taskID, *nJobs, *orgFlag, *providerF)
-		monitorTask(ctx, pool, taskID)
+		handleCreateTaskMode(ctx, pool)
 	case "worker":
-		if err := runWorker(ctx, pool); err != nil {
-			panic(err)
-		}
+		handleWorkerMode(ctx, pool)
 	default:
 		fmt.Println("Unknown -mode. Use init | worker | create-task")
 	}
 }
 
-// ---------------- Schema ----------------
+// ---------------- Mode Handlers ----------------
 
-func initSchema(ctx context.Context, db *pgxpool.Pool) error {
-	stmts := []string{
-		`CREATE EXTENSION IF NOT EXISTS pgcrypto;`,
-		// tasks table (mirrors your existing shape, simplified)
-		`CREATE TABLE IF NOT EXISTS tasks (
-			id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-			org_id TEXT NOT NULL,
-			user_id TEXT,
-			type TEXT NOT NULL,
-			input JSONB NOT NULL,
-			status TEXT NOT NULL DEFAULT 'pending', -- pending|running|completed|failed
-			result JSONB,
-			current_step JSONB,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			finished_at TIMESTAMPTZ
-		);`,
-		// Backfill-safe add for existing DBs
-		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS current_step JSONB;`,
-		// jobs table (general queue)
-		`CREATE TABLE IF NOT EXISTS jobs (
-			id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-			org_id TEXT NOT NULL,
-			task_id uuid REFERENCES tasks(id),
-			type TEXT NOT NULL,
-			input JSONB NOT NULL, -- includes {"provider": "openai" | "anthropic" | ...}
-			status TEXT NOT NULL DEFAULT 'pending',  -- pending|processing|succeeded|failed
-			result JSONB,
-			errors TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
-			attempts INT NOT NULL DEFAULT 0,
-			max_attempts INT NOT NULL DEFAULT 3,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		);`,
-		`CREATE INDEX IF NOT EXISTS jobs_status_prio_created_idx ON jobs(status, created_at);`,
-		`CREATE INDEX IF NOT EXISTS jobs_org_status_idx ON jobs(org_id, status);`,
+func handleInitMode(ctx context.Context, pool *pgxpool.Pool) {
+	if err := initSchema(ctx, pool); err != nil {
+		panic(err)
 	}
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	for _, s := range stmts {
-		if _, err := tx.Exec(ctx, s); err != nil {
-			return err
-		}
-	}
-	return tx.Commit(ctx)
+	fmt.Println("Schema initialized.")
 }
 
-// ------------- Task + Job creation -------------
-
-func createTaskWithJobs(ctx context.Context, db *pgxpool.Pool, orgID, provider string, count int) (string, error) {
-	// Create task
-	taskInput := map[string]any{
-		"reason":   "demo load",
-		"provider": provider,
-	}
-	taskInputJSON, _ := json.Marshal(taskInput)
-
-	var taskID string
-	err := db.QueryRow(ctx, `
-		INSERT INTO tasks (org_id, user_id, type, input, status)
-		VALUES ($1, $2, 'sheet.enrich', $3::jsonb, 'running')
-		RETURNING id::text
-	`, orgID, "user-demo", string(taskInputJSON)).Scan(&taskID)
+func handleCreateTaskMode(ctx context.Context, pool *pgxpool.Pool) {
+	taskID, err := createTaskWithJobs(ctx, pool, *orgFlag, *providerFlag, *nJobs)
 	if err != nil {
-		return "", err
+		panic(err)
 	}
-
-	// Step 1: enqueueing jobs (5%)
-	_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
-		Name:        "enqueue_jobs",
-		Description: fmt.Sprintf("Enqueuing %d jobs", count),
-		Percentage:  5,
-	})
-
-	// Create jobs
-	now := time.Now()
-	batch := db.Config().ConnConfig.RuntimeParams
-	_ = batch // (no-op, just to hint this is a demo; we'll use simple inserts)
-
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback(ctx)
-
-	for i := 0; i < count; i++ {
-		jobInput := map[string]any{
-			"provider": provider,
-			"payload": map[string]any{
-				"row_index": i,
-				"seed":      randHex(8),
-			},
-		}
-		inJSON, _ := json.Marshal(jobInput)
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO jobs (org_id, task_id, type, input, status, max_attempts, created_at, updated_at)
-			VALUES ($1, $2, 'sheet.enrich', $3::jsonb, 'pending', 3, $4, $4)
-		`, orgID, taskID, string(inJSON), now); err != nil {
-			return "", err
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return "", err
-	}
-
-	// Step 2: processing (10% to 99% handled by monitor)
-	_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
-		Name:        "process_jobs",
-		Description: "Processing enqueued jobs",
-		Percentage:  10,
-	})
-	return taskID, nil
+	fmt.Printf("Created task %s with %d jobs for org=%s provider=%s\n", taskID, *nJobs, *orgFlag, *providerFlag)
+	monitorTask(ctx, pool, taskID)
 }
 
-func monitorTask(ctx context.Context, db *pgxpool.Pool, taskID string) {
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	start := time.Now()
-	lastReported := -1
-	for {
-		<-ticker.C
-		var total, done, failed, processing int
-		err := db.QueryRow(ctx, `
-			SELECT
-			  COUNT(*) FILTER (WHERE task_id = $1) AS total,
-			  COUNT(*) FILTER (WHERE task_id = $1 AND status='succeeded') AS done,
-			  COUNT(*) FILTER (WHERE task_id = $1 AND status='failed') AS failed,
-			  COUNT(*) FILTER (WHERE task_id = $1 AND status='processing') AS processing
-			FROM jobs
-		`, taskID).Scan(&total, &done, &failed, &processing)
-		if err != nil {
-			fmt.Println("monitor error:", err)
-			continue
-		}
-		fmt.Printf("[monitor] elapsed=%s total=%d done=%d failed=%d processing=%d pending=%d\n",
-			time.Since(start).Truncate(time.Second), total, done, failed, processing, total-done-failed-processing)
-
-		// Live progress → 10..99% based on completed fraction
-		if total > 0 && done+failed < total {
-			frac := float64(done+failed) / float64(total)
-			pct := int(math.Max(10, math.Min(99, math.Round(10.0+frac*90.0))))
-			if pct != lastReported {
-				_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
-					Name:        "process_jobs",
-					Description: "Processing enqueued jobs",
-					Percentage:  pct,
-				})
-				fmt.Printf("[step] %d%% - process_jobs\n", pct)
-				lastReported = pct
-			}
-		}
-
-		if total > 0 && done+failed == total {
-			// mark task completed/failed
-			status := "completed"
-			if done == 0 {
-				status = "failed"
-			}
-			_, _ = db.Exec(ctx, `
-				UPDATE tasks
-				SET status=$2, finished_at=now(), updated_at=now(), result=$3::jsonb
-				WHERE id=$1
-			`, taskID, status, fmt.Sprintf(`{"done":%d,"failed":%d}`, done, failed))
-
-			// Finalize step (100%)
-			_ = setTaskCurrentStep(ctx, db, taskID, TaskStep{
-				Name:        "finalize",
-				Description: "Task finalized",
-				Percentage:  100,
-			})
-			fmt.Println("[step] 100% - finalize")
-			fmt.Println("Task finished with status:", status)
-			return
-		}
+func handleWorkerMode(ctx context.Context, pool *pgxpool.Pool) {
+	if err := runWorker(ctx, pool); err != nil {
+		panic(err)
 	}
 }
 
 // ---------------- Worker (single machine) ----------------
 
-// JobMeta: light candidate
-type JobMeta struct {
-	ID  string
-	Org string
+// processingTracker keeps in-memory counts of currently-running jobs
+type processingTracker struct {
+	mu         sync.Mutex
+	total      int
+	byProvider map[string]int
+	byOrg      map[string]int
 }
 
-type ClaimedJob struct {
-	ID         string
-	Org        string
-	Type       string
-	Input      json.RawMessage
-	Attempts   int
-	MaxAttempt int
-}
-
-func runWorker(ctx context.Context, db *pgxpool.Pool) error {
-	// Provider → limiter
-	providerRPS := map[string]int{
-		"openai":    *rpsOpenAI,
-		"anthropic": *rpsAnthropic,
-		"gemini":    *rpsGemini,
-	}
-	providerLimiter := map[string]*rate.Limiter{}
-	for p, rps := range providerRPS {
-		if rps < 1 {
-			rps = 1
-		}
-		providerLimiter[p] = rate.NewLimiter(rate.Limit(rps), rps) // burst=rps
-	}
-
-	// In-flight limiter (concurrency gate)
-	inflightCh := make(chan struct{}, *inflight)
-	for i := 0; i < *inflight; i++ {
-		inflightCh <- struct{}{}
-	}
-
-	// In-memory candidate queues (org → FIFO of job IDs)
-	queues := map[string][]JobMeta{}
-	qMu := sync.Mutex{}
-
-	// Keep a small set of "seen" IDs so the refill loop doesn't re-add
-	seen := newStringSet()
-
-	// Refill loop: prefetch candidates into in-memory queues
-	go func() {
-		for {
-			// quick sleep to avoid hammering db
-			time.Sleep(1000 * time.Millisecond)
-
-			qMu.Lock()
-			totalCandidates := 0
-			for _, q := range queues {
-				totalCandidates += len(q)
-			}
-			qMu.Unlock()
-
-			if totalCandidates >= *refillTrig {
-				continue
-			}
-			want := *prefetchN - totalCandidates
-			if want < 100 {
-				want = 100
-			}
-			metas, err := fetchCandidates(ctx, db, want)
-			if err != nil {
-				fmt.Println("refill fetch error:", err)
-				continue
-			}
-			if len(metas) == 0 {
-				continue
-			}
-			qMu.Lock()
-			for _, m := range metas {
-				if seen.Has(m.ID) {
-					continue
-				}
-				seen.Add(m.ID)
-				queues[m.Org] = append(queues[m.Org], m)
-			}
-			qMu.Unlock()
-		}
-	}()
-
-	// Round-robin org order
-	rrOrder := []string{}
-	rrIdx := 0
-
-	// Dispatch loop
-	for {
-		// Build / refresh round-robin order from current keys
-		qMu.Lock()
-		rrOrder = rrOrder[:0]
-		for org, q := range queues {
-			if len(q) > 0 {
-				rrOrder = append(rrOrder, org)
-			}
-		}
-		sort.Strings(rrOrder) // stable order; not required, but nice
-		qMu.Unlock()
-
-		if len(rrOrder) == 0 {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-
-		// Pick next org (RR)
-		org := rrOrder[rrIdx%len(rrOrder)]
-		rrIdx++
-
-		// Pop one candidate from that org
-		var meta JobMeta
-		qMu.Lock()
-		q := queues[org]
-		if len(q) == 0 {
-			qMu.Unlock()
-			continue
-		}
-		meta, queues[org] = q[0], q[1:]
-		qMu.Unlock()
-
-		// Attempt to claim atomically
-		claimed, ok, err := claimJob(ctx, db, meta.ID)
-		if err != nil {
-			fmt.Println("claim error:", err)
-			seen.Delete(meta.ID)
-			continue
-		}
-		if !ok {
-			// someone else (or earlier pass) changed status
-			seen.Delete(meta.ID)
-			continue
-		}
-
-		// Rate limit by provider
-		provider := providerFromInput(claimed.Input)
-		lim := providerLimiter[provider]
-		if lim == nil {
-			// Unknown provider → treat as very low rate
-			lim = rate.NewLimiter(1, 1)
-			providerLimiter[provider] = lim
-		}
-
-		<-inflightCh
-		go func(j ClaimedJob) {
-			defer func() { inflightCh <- struct{}{}; seen.Delete(j.ID) }()
-
-			// Wait for provider token
-			ctx2, cancel := context.WithTimeout(ctx, 3*time.Minute)
-			defer cancel()
-			if err := lim.Wait(ctx2); err != nil {
-				// Couldn't obtain token; put back as pending (counts as an error attempt)
-				_ = appendErrorOrRetry(ctx, db, j.ID, "provider limiter wait canceled")
-				return
-			}
-
-			start := time.Now()
-			// Simulate execution (sleep around 30s, 1% error)
-			sleepDur, fail := simulateRun()
-			select {
-			case <-time.After(sleepDur):
-			case <-ctx2.Done():
-				fail = true
-			}
-
-			if fail {
-				_ = appendErrorOrRetry(ctx, db, j.ID, fmt.Sprintf("simulated failure after %s", time.Since(start).Truncate(time.Millisecond)))
-				return
-			}
-
-			// Success: write result JSON
-			result := map[string]any{
-				"ok":        true,
-				"provider":  provider,
-				"elapsedMs": time.Since(start).Milliseconds(),
-			}
-			resJSON, _ := json.Marshal(result)
-			if err := markSucceeded(ctx, db, j.ID, string(resJSON)); err != nil {
-				// If result write fails, treat as retryable
-				_ = appendErrorOrRetry(ctx, db, j.ID, "post-success write failure: "+err.Error())
-				return
-			}
-		}(claimed)
+func newProcessingTracker() *processingTracker {
+	return &processingTracker{
+		byProvider: map[string]int{},
+		byOrg:      map[string]int{},
 	}
 }
 
-// fetchCandidates pulls light candidates (no JSONB) for pending jobs.
-// NOTE: We do NOT lease here; claim happens at dispatch via UPDATE ... RETURNING.
-func fetchCandidates(ctx context.Context, db *pgxpool.Pool, n int) ([]JobMeta, error) {
-	rows, err := db.Query(ctx, `
-		SELECT id::text, org_id
-		FROM jobs
-		WHERE status='pending'
-		ORDER BY created_at
-		LIMIT $1
-	`, n)
-	if err != nil {
-		return nil, err
+func (t *processingTracker) add(provider, org string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.total++
+	t.byProvider[provider]++
+	t.byOrg[org]++
+}
+
+func (t *processingTracker) done(provider, org string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.total > 0 {
+		t.total--
 	}
-	defer rows.Close()
-
-	var out []JobMeta
-	for rows.Next() {
-		var m JobMeta
-		if err := rows.Scan(&m.ID, &m.Org); err != nil {
-			return nil, err
-		}
-		out = append(out, m)
+	if t.byProvider[provider] > 0 {
+		t.byProvider[provider]--
 	}
-	return out, rows.Err()
-}
-
-func claimJob(ctx context.Context, db *pgxpool.Pool, id string) (ClaimedJob, bool, error) {
-	var cj ClaimedJob
-	err := db.QueryRow(ctx, `
-		UPDATE jobs
-		SET status='processing', updated_at=now()
-		WHERE id=$1 AND status='pending'
-		RETURNING id::text, org_id, type, input, attempts, max_attempts
-	`, id).Scan(&cj.ID, &cj.Org, &cj.Type, &cj.Input, &cj.Attempts, &cj.MaxAttempt)
-	if err != nil {
-		// Not found or not pending → no rows
-		if strings.Contains(err.Error(), "no rows") {
-			return ClaimedJob{}, false, nil
-		}
-		return ClaimedJob{}, false, err
+	if t.byOrg[org] > 0 {
+		t.byOrg[org]--
 	}
-	return cj, true, nil
-}
-
-func appendErrorOrRetry(ctx context.Context, db *pgxpool.Pool, id string, msg string) error {
-	_, err := db.Exec(ctx, `
-		UPDATE jobs
-		SET errors = array_append(errors, $2),
-			attempts = attempts + 1,
-			status = CASE WHEN attempts + 1 >= max_attempts THEN 'failed' ELSE 'pending' END,
-			updated_at = now()
-		WHERE id = $1
-	`, id, msg)
-	return err
-}
-
-func markSucceeded(ctx context.Context, db *pgxpool.Pool, id string, resultJSON string) error {
-	_, err := db.Exec(ctx, `
-		UPDATE jobs
-		SET status='succeeded', result=$2::jsonb, updated_at=now()
-		WHERE id=$1
-	`, id, resultJSON)
-	return err
-}
-
-// -------------- Task step persistence --------------
-
-type TaskStep struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Percentage  int    `json:"percentage"`
-}
-
-func setTaskCurrentStep(ctx context.Context, db *pgxpool.Pool, taskID string, step TaskStep) error {
-	b, _ := json.Marshal(step)
-	_, err := db.Exec(ctx, `
-		UPDATE tasks
-		SET current_step = $2::jsonb, updated_at = now()
-		WHERE id = $1
-	`, taskID, string(b))
-	return err
 }
 
 // ---------------- Simulation helpers ----------------
 
 func simulateRun() (time.Duration, bool) {
 	// ~Normal(30s, 6s^2) → clamp to [1s, 120s]
-	mean := 30.0
-	std := 6.0
-	secs := mean + mathrand.NormFloat64()*std
-	if secs < 1 {
-		secs = 1
+	secs := SimulationMeanDuration + mathrand.NormFloat64()*SimulationStdDev
+	if secs < SimulationMinDuration {
+		secs = SimulationMinDuration
 	}
-	if secs > 120 {
-		secs = 120
+	if secs > SimulationMaxDuration {
+		secs = SimulationMaxDuration
 	}
-	// 1% failure
-	fail := mathrand.Intn(100) == 0
+	// 1% failure rate
+	fail := mathrand.Intn(SimulationFailureChance) < SimulationFailureRate
 	return time.Duration(secs * float64(time.Second)), fail
 }
 
