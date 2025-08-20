@@ -3,13 +3,13 @@
 // Usage examples:
 //
 // 1) Init schema:
-//    go run main.go -mode=init -dsn="postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
+//    go run *.go -mode=init -dsn="postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
 //
 // 2) Run worker (single machine):
-//    go run main.go -mode=worker -dsn="postgres://..." -prefetch=1000 -inflight=400
+//    go run *.go -mode=worker -dsn="postgres://..." -prefetch=1000 -inflight=400
 //
 // 3) Create a task with 250 jobs for org "orgA", provider "openai", then monitor it:
-//    go run main.go -mode=create-task -dsn="postgres://..." -org=orgA -jobs=250 -provider=openai
+//    go run *.go -mode=create-task -dsn="postgres://..." -org=orgA -jobs=250 -provider=openai
 //
 // Providers & default RPS caps (override with -rps.<provider>=N):
 //   openai=120 rps, anthropic=80 rps, gemini=60 rps
